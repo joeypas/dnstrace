@@ -26,19 +26,19 @@ var (
 	Tag = ""
 	// Commit is set by build at compile time to Git SHA1
 	Commit = ""
-	author = "Rahul Powar <rahul@redsift.io>"
+	author = "Rahul Powar <rahul@redsift.io>, Joe Liotta <jliotta03@gmail.com>"
 )
 
 var (
 	pApp = kingpin.New("dnstrace", "A high QPS DNS benchmark.").Author(author)
 
 	pServer = pApp.Flag("server", "DNS server IP:port to test.").Short('s').Default("127.0.0.1").String()
-	pType   = pApp.Flag("type", "Query type.").Short('t').Default("A").Enum("TXT", "A", "AAAA") //TODO: Rest of them pt 1
+	pType   = pApp.Flag("type", "Query type.").Short('t').Default("A").Enum("TXT", "A", "AAAA", "NS", "SOA") //TODO: Rest of them pt 1
 
 	pCount       = pApp.Flag("number", "Number of queries to issue. Note that the total number of queries issued = number*concurrency*len(queries).").Short('n').Default("1").Int64()
 	pConcurrency = pApp.Flag("concurrency", "Number of concurrent queries to issue.").Short('c').Default("1").Uint32()
 	pRate        = pApp.Flag("rate-limit", "Apply a global questions / second rate limit.").Short('l').Default("0").Int()
-	pQperConn     = pApp.Flag("query-per-conn", "Queries on a connection before creating a new one. 0: unlimited").Default("0").Int64()
+	pQperConn    = pApp.Flag("query-per-conn", "Queries on a connection before creating a new one. 0: unlimited").Default("0").Int64()
 
 	pExpect = pApp.Flag("expect", "Expect a specific response.").Short('e').Strings()
 
@@ -105,6 +105,11 @@ func do(ctx context.Context) []*rstats {
 		qType = dns.TypeA
 	case "AAAA":
 		qType = dns.TypeAAAA
+	case "NS":
+		qType = dns.TypeNS
+	case "SOA":
+		qType = dns.TypeSOA
+
 	default:
 		panic(fmt.Errorf("Unknown type %q", *pType))
 	}
@@ -170,7 +175,7 @@ func do(ctx context.Context) []*rstats {
 					if ctx.Err() != nil {
 						return
 					}
-					if co!=nil && *pQperConn>0 && i%*pQperConn==0 {
+					if co != nil && *pQperConn > 0 && i%*pQperConn == 0 {
 						co.Close()
 						co = nil
 					}
@@ -254,8 +259,21 @@ func do(ctx context.Context) []*rstats {
 								case dns.TypeTXT:
 									t := s.(*dns.TXT)
 									ok = isExpected(strings.Join(t.Txt, ""))
-								}
 
+								case dns.TypeNS:
+									rr := s.(*dns.NS)
+									ok = isExpected(sprintName(rr.Ns))
+
+								case dns.TypeSOA:
+									rr := s.(*dns.SOA)
+									ok = isExpected(
+										sprintName(rr.Ns) + " " + sprintName(rr.Mbox) +
+											" " + strconv.FormatInt(int64(rr.Serial), 10) +
+											" " + strconv.FormatInt(int64(rr.Refresh), 10) +
+											" " + strconv.FormatInt(int64(rr.Retry), 10) +
+											" " + strconv.FormatInt(int64(rr.Expire), 10) +
+											" " + strconv.FormatInt(int64(rr.Minttl), 10))
+								}
 								if ok {
 									atomic.AddInt64(&matched, 1)
 									break
@@ -284,6 +302,137 @@ func do(ctx context.Context) []*rstats {
 	return stats
 }
 
+func sprintName(s string) string {
+	src := []byte(s)
+	dst := make([]byte, 0, len(src))
+	for i := 0; i < len(src); {
+		if i+1 < len(src) && src[i] == '\\' && src[i+1] == '.' {
+			dst = append(dst, src[i:i+2]...)
+			i += 2
+		} else {
+			b, n := nextByte(src, i)
+			if n == 0 {
+				i++ // dangling back slash
+			} else if b == '.' {
+				dst = append(dst, b)
+			} else {
+				dst = appendDomainNameByte(dst, b)
+			}
+			i += n
+		}
+	}
+	return string(dst)
+}
+
+func sprintTxtOctet(s string) string {
+	src := []byte(s)
+	dst := make([]byte, 0, len(src))
+	dst = append(dst, '"')
+	for i := 0; i < len(src); {
+		if i+1 < len(src) && src[i] == '\\' && src[i+1] == '.' {
+			dst = append(dst, src[i:i+2]...)
+			i += 2
+		} else {
+			b, n := nextByte(src, i)
+			if n == 0 {
+				i++ // dangling back slash
+			} else if b == '.' {
+				dst = append(dst, b)
+			} else {
+				if b < ' ' || b > '~' {
+					dst = appendByte(dst, b)
+				} else {
+					dst = append(dst, b)
+				}
+			}
+			i += n
+		}
+	}
+	dst = append(dst, '"')
+	return string(dst)
+}
+
+func sprintTxt(txt []string) string {
+	var out []byte
+	for i, s := range txt {
+		if i > 0 {
+			out = append(out, ` "`...)
+		} else {
+			out = append(out, '"')
+		}
+		bs := []byte(s)
+		for j := 0; j < len(bs); {
+			b, n := nextByte(bs, j)
+			if n == 0 {
+				break
+			}
+			out = appendTXTStringByte(out, b)
+			j += n
+		}
+		out = append(out, '"')
+	}
+	return string(out)
+}
+
+func appendDomainNameByte(s []byte, b byte) []byte {
+	switch b {
+	case '.', ' ', '\'', '@', ';', '(', ')': // additional chars to escape
+		return append(s, '\\', b)
+	}
+	return appendTXTStringByte(s, b)
+}
+
+func appendTXTStringByte(s []byte, b byte) []byte {
+	switch b {
+	case '"', '\\':
+		return append(s, '\\', b)
+	}
+	if b < ' ' || b > '~' {
+		return appendByte(s, b)
+	}
+	return append(s, b)
+}
+
+func appendByte(s []byte, b byte) []byte {
+	var buf [3]byte
+	bufs := strconv.AppendInt(buf[:0], int64(b), 10)
+	s = append(s, '\\')
+	for i := 0; i < 3-len(bufs); i++ {
+		s = append(s, '0')
+	}
+	for _, r := range bufs {
+		s = append(s, r)
+	}
+	return s
+}
+
+func nextByte(b []byte, offset int) (byte, int) {
+	if offset >= len(b) {
+		return 0, 0
+	}
+	if b[offset] != '\\' {
+		// not an escape sequence
+		return b[offset], 1
+	}
+	switch len(b) - offset {
+	case 1: // dangling escape
+		return 0, 0
+	case 2, 3: // too short to be \ddd
+	default: // maybe \ddd
+		if isDigit(b[offset+1]) && isDigit(b[offset+2]) && isDigit(b[offset+3]) {
+			return dddToByte(b[offset+1:]), 4
+		}
+	}
+	// not \ddd, just an RFC 1035 "quoted" character
+	return b[offset+1], 2
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+func dddToByte(s []byte) byte {
+	return byte((s[0]-'0')*100 + (s[1]-'0')*10 + (s[2] - '0'))
+}
+
 func printProgress() {
 
 	if *pSilent {
@@ -291,7 +440,6 @@ func printProgress() {
 	}
 
 	fmt.Println()
-
 
 	errorFprint := color.New(color.FgRed).Fprint
 	successFprint := color.New(color.FgGreen).Fprint
